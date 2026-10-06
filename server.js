@@ -6,6 +6,8 @@
    - /info ...... IPs locales y puerto (para armar la URL del QR en la red local).
    - /qr.svg .... genera el código QR (funciona sin internet en la red local).
    - /health .... comprobación de estado para el hosting.
+   - Guías: el maestro envía la canción (song) y el estado de las secciones open (songctl);
+     el servidor las reenvía a los esclavos y las guarda para los que se unen después.
    Uso local:  npm install  →  npm start   (o PORT=9000 node server.js)
    En la nube: ALLOWED_ORIGINS=https://tu-app.github.io limita qué sitios pueden conectarse.
    ===================================================================== */
@@ -21,6 +23,8 @@ const PORT = Number(process.env.PORT) || 8080;
 const ROOT = __dirname;
 const HEARTBEAT_MS = 15000;
 const BPM_MIN = 30, BPM_MAX = 300;
+const PROTOCOL_VERSION = 2;          // 2: guías de canción (song / songctl)
+const MAX_MESSAGE = 512 * 1024;      // una guía de varios instrumentos ocupa decenas de KB
 // orígenes autorizados para el WebSocket (vacío: cualquiera)
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim().replace(/\/+$/, '')).filter(Boolean);
 
@@ -83,7 +87,7 @@ const server = http.createServer(async (req, res) => {
 // room = { master: ws|null, slaves: Set<ws>, state: último estado del maestro }
 const rooms = new Map();
 const getRoom = id => {
-  if (!rooms.has(id)) rooms.set(id, { master: null, slaves: new Set(), state: null });
+  if (!rooms.has(id)) rooms.set(id, { master: null, slaves: new Set(), state: null, song: null, songctl: null });
   return rooms.get(id);
 };
 const json = (ws, o) => { if (ws.readyState === 1) ws.send(JSON.stringify(o)); };
@@ -108,7 +112,7 @@ function sanitizeState(m) {
 }
 
 const wss = new WebSocketServer({
-  server, path: '/sync', maxPayload: 4096, perMessageDeflate: false,
+  server, path: '/sync', maxPayload: MAX_MESSAGE, perMessageDeflate: false,
   verifyClient: ({ origin }) => !ALLOWED_ORIGINS.length || ALLOWED_ORIGINS.includes(origin)
 });
 wss.on('connection', ws => {
@@ -144,8 +148,9 @@ wss.on('connection', ws => {
           room.slaves.add(ws);
         }
         ws.room = String(m.room); ws.role = m.role;
-        json(ws, { type: 'welcome', peers: room.slaves.size, hasMaster: !!room.master,
-          state: m.role === 'slave' ? room.state : null });
+        const slave = m.role === 'slave';
+        json(ws, { type: 'welcome', v: PROTOCOL_VERSION, peers: room.slaves.size, hasMaster: !!room.master,
+          state: slave ? room.state : null, song: slave ? room.song : null, songctl: slave ? room.songctl : null });
         return notifyPeers(room);
       }
 
@@ -156,6 +161,19 @@ wss.on('connection', ws => {
         if (!st) return;
         room.state = st;
         const out = JSON.stringify(st);
+        room.slaves.forEach(s => { if (s.readyState === 1) s.send(out); });
+        return;
+      }
+
+      case 'song':       // guía completa (o null para quitarla)
+      case 'songctl': {  // vueltas de las secciones open
+        const room = rooms.get(ws.room);
+        if (!room || room.master !== ws) return;
+        const isSong = m.type === 'song';
+        const payload = isSong ? { type: 'song', song: m.song && typeof m.song === 'object' ? m.song : null }
+                               : { type: 'songctl', exits: m.exits && typeof m.exits === 'object' ? m.exits : {} };
+        if (isSong) room.song = payload.song; else room.songctl = payload;
+        const out = JSON.stringify(payload);
         room.slaves.forEach(s => { if (s.readyState === 1) s.send(out); });
       }
     }
