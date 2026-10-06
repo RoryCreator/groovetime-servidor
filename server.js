@@ -6,8 +6,9 @@
    - /info ...... IPs locales y puerto (para armar la URL del QR en la red local).
    - /qr.svg .... genera el código QR (funciona sin internet en la red local).
    - /health .... comprobación de estado para el hosting.
-   - Guías: el maestro envía la canción (song) y el estado de las secciones open (songctl);
-     el servidor las reenvía a los esclavos y las guarda para los que se unen después.
+   - Relevo del maestro (RELAY): configuración musical (config), guía de la canción (song) y
+     secciones open (songctl). El servidor las reenvía a los esclavos y guarda la última de
+     cada tipo para los que se unen después.
    Uso local:  npm install  →  npm start   (o PORT=9000 node server.js)
    En la nube: ALLOWED_ORIGINS=https://tu-app.github.io limita qué sitios pueden conectarse.
    ===================================================================== */
@@ -23,7 +24,7 @@ const PORT = Number(process.env.PORT) || 8080;
 const ROOT = __dirname;
 const HEARTBEAT_MS = 15000;
 const BPM_MIN = 30, BPM_MAX = 300;
-const PROTOCOL_VERSION = 2;          // 2: guías de canción (song / songctl)
+const PROTOCOL_VERSION = 3;          // 2: guías de canción (song / songctl) · 3: configuración musical (config)
 const MAX_MESSAGE = 512 * 1024;      // una guía de varios instrumentos ocupa decenas de KB
 // orígenes autorizados para el WebSocket (vacío: cualquiera)
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim().replace(/\/+$/, '')).filter(Boolean);
@@ -87,9 +88,11 @@ const server = http.createServer(async (req, res) => {
 // room = { master: ws|null, slaves: Set<ws>, state: último estado del maestro }
 const rooms = new Map();
 const getRoom = id => {
-  if (!rooms.has(id)) rooms.set(id, { master: null, slaves: new Set(), state: null, song: null, songctl: null });
+  if (!rooms.has(id)) rooms.set(id, { master: null, slaves: new Set(), state: null, relay: {} });
   return rooms.get(id);
 };
+// mensajes del maestro que se reenvían tal cual a los esclavos: tipo → campo con el contenido
+const RELAY = { config: 'cfg', song: 'song', songctl: 'exits' };
 const json = (ws, o) => { if (ws.readyState === 1) ws.send(JSON.stringify(o)); };
 function notifyPeers(room) {
   // maxRtt: peor latencia de los esclavos, para que el maestro calcule cuánto anticipar los cambios
@@ -108,7 +111,10 @@ function sanitizeState(m) {
   }
   const at = Number(m.at), q = Number(m.q);
   if (!Number.isFinite(at) || !Number.isFinite(q)) return null;
-  return { type: 'state', playing: true, bpm, at, q };
+  const st = { type: 'state', playing: true, bpm, at, q };
+  const c = Number(m.c), cb = Number(m.cb);                 // clave con tempo propio: fase y tempo
+  if (m.c !== undefined && Number.isFinite(c) && cb >= BPM_MIN && cb <= BPM_MAX) { st.c = c; st.cb = cb; }
+  return st;
 }
 
 const wss = new WebSocketServer({
@@ -150,7 +156,7 @@ wss.on('connection', ws => {
         ws.room = String(m.room); ws.role = m.role;
         const slave = m.role === 'slave';
         json(ws, { type: 'welcome', v: PROTOCOL_VERSION, peers: room.slaves.size, hasMaster: !!room.master,
-          state: slave ? room.state : null, song: slave ? room.song : null, songctl: slave ? room.songctl : null });
+          state: slave ? room.state : null, relay: slave ? room.relay : null });
         return notifyPeers(room);
       }
 
@@ -165,14 +171,13 @@ wss.on('connection', ws => {
         return;
       }
 
-      case 'song':       // guía completa (o null para quitarla)
-      case 'songctl': {  // vueltas de las secciones open
+      default: {         // relevo: config, song, songctl
+        const field = RELAY[m.type];
         const room = rooms.get(ws.room);
-        if (!room || room.master !== ws) return;
-        const isSong = m.type === 'song';
-        const payload = isSong ? { type: 'song', song: m.song && typeof m.song === 'object' ? m.song : null }
-                               : { type: 'songctl', exits: m.exits && typeof m.exits === 'object' ? m.exits : {} };
-        if (isSong) room.song = payload.song; else room.songctl = payload;
+        if (!field || !room || room.master !== ws) return;
+        const value = m[field] && typeof m[field] === 'object' ? m[field] : null;
+        const payload = { type: m.type, [field]: value };
+        room.relay[m.type] = payload;
         const out = JSON.stringify(payload);
         room.slaves.forEach(s => { if (s.readyState === 1) s.send(out); });
       }
