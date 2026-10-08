@@ -18,6 +18,8 @@
    - Versión 6 (Stick Master): cada app puede tener su propio espacio de salas (hello.app), así un
      código de GROOVETIME y uno de Stick Master nunca se cruzan. Relevo smcfg (configuración de la
      clase) y marcador en vivo (score): cada alumno envía su precisión y racha, sólo al maestro.
+   - Versión 7 (Stick Master): el maestro puede mirar a un alumno (smwatch); mientras lo mira, ese
+     alumno le envía el resultado de cada nota (smlive) y el maestro dibuja su pantalla en vivo.
    Uso local:  npm install  →  npm start   (o PORT=9000 node server.js)
    En la nube: ALLOWED_ORIGINS=https://tu-app.github.io limita qué sitios pueden conectarse.
    ===================================================================== */
@@ -33,10 +35,11 @@ const PORT = Number(process.env.PORT) || 8080;
 const ROOT = __dirname;
 const HEARTBEAT_MS = 15000;
 const BPM_MIN = 30, BPM_MAX = 300;
-const PROTOCOL_VERSION = 6;          // 2: guías de canción (song / songctl) · 3: configuración musical (config)
+const PROTOCOL_VERSION = 7;          // 2: guías de canción (song / songctl) · 3: configuración musical (config)
                                      // 4: PFG Player (pset, pstage, pplay, prel) y archivos por partes (blob)
                                      // 5: equipos de la sala (pdev: pantalla de video, equipo de audio)
                                      // 6: salas por app (hello.app), Stick Master (smcfg) y marcador (score)
+                                     // 7: ver a un alumno en vivo (smwatch maestro→alumno, smlive alumno→maestro)
 const MAX_MESSAGE = 512 * 1024;      // una guía de varios instrumentos ocupa decenas de KB
 const BLOB_CHUNK_MAX = 256 * 1024;   // caracteres por parte de un archivo
 const BLOB_MAX_PARTS = 512;          // hasta ~128 MB por archivo
@@ -185,8 +188,17 @@ function sanitizeScore(d) {
   return {
     n: String(d.n || '').slice(0, 24), m: ['book', 'free', 'capture'].includes(d.m) ? d.m : 'book', run: !!d.run,
     p: int(d.p ?? -1, -1, 100), st: int(d.st, 0, 1e6), b: int(d.b, 0, 1e6), h: int(d.h, 0, 1e7),
+    ok: int(d.ok, 0, 1e7), er: int(d.er, 0, 1e7), off: int(d.off, -1000, 1000),
     t: String(d.t || '').slice(0, 12), s: d.s === 'mic' ? 'mic' : 'touch'
   };
+}
+// Stick Master en vivo: resultado de una nota o golpe del alumno que el maestro está mirando
+const LIVE_NUM = ['r', 'i', 'ok', 'o', 't', 'a', 'st', 'b', 'okc', 'er', 'p'];
+function sanitizeLive(e) {
+  if (!e || typeof e !== 'object' || !['n', 'm', 'x', 'h'].includes(e.k)) return null;
+  const out = { k: e.k, hd: e.hd === 'L' || e.hd === 'R' ? e.hd : null };
+  for (const k of LIVE_NUM) { const v = Number(e[k]); if (Number.isFinite(v)) out[k] = v; }
+  return out;
 }
 // espacio de salas por app: sin app (GROOVETIME, PFG Player) la clave es el código tal cual
 const roomKey = (room, app) => /^[a-z]{2,8}$/.test(String(app || '')) ? `${app}:${room}` : String(room);
@@ -249,6 +261,21 @@ wss.on('connection', ws => {
         if (!room || ws.role !== 'slave') return;
         ws.score = sanitizeScore(m.s);
         if (room.master) json(room.master, { type: 'score', id: ws.id, s: ws.score });
+        return;
+      }
+
+      case 'smwatch': {  // Stick Master: el maestro empieza o deja de mirar a un alumno
+        const room = rooms.get(ws.room);
+        if (!room || room.master !== ws) return;
+        room.slaves.forEach(s => { if (s.id === Number(m.id)) json(s, { type: 'smwatch', on: !!m.on }); });
+        return;
+      }
+
+      case 'smlive': {   // Stick Master: resultado en vivo del alumno mirado (sólo al maestro)
+        const room = rooms.get(ws.room);
+        const e = sanitizeLive(m.e);
+        if (!room || ws.role !== 'slave' || !room.master || !e) return;
+        json(room.master, { type: 'smlive', id: ws.id, e });
         return;
       }
 
