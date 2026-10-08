@@ -1,6 +1,6 @@
 'use strict';
 /* =====================================================================
-   GROOVETIME · servidor de sincronización maestro/esclavo (red local o nube)
+   GROOVETIME y PFG Player · servidor de sincronización maestro/esclavo (red local o nube)
    - Sirve la app (index.html, manifest, iconos, sw.js) si los archivos están junto a él.
    - /sync ...... WebSocket: salas de 4 dígitos con un maestro y N esclavos.
    - /info ...... IPs locales y puerto (para armar la URL del QR en la red local).
@@ -9,6 +9,10 @@
    - Relevo del maestro (RELAY): configuración musical (config), guía de la canción (song) y
      secciones open (songctl). El servidor las reenvía a los esclavos y guarda la última de
      cada tipo para los que se unen después.
+   - PFG Player (versión 4): set list (pset), tema en escena (pstage), reproducción (pplay) y
+     salida de secciones OPEN (prel) por el mismo relevo. Las guías (y los PDF) viajan como
+     archivos por partes (blob): el maestro los sube una vez por sala, el servidor los guarda en
+     memoria mientras la sala exista y cada esclavo pide sólo los que no tiene en su caché.
    Uso local:  npm install  →  npm start   (o PORT=9000 node server.js)
    En la nube: ALLOWED_ORIGINS=https://tu-app.github.io limita qué sitios pueden conectarse.
    ===================================================================== */
@@ -24,8 +28,13 @@ const PORT = Number(process.env.PORT) || 8080;
 const ROOT = __dirname;
 const HEARTBEAT_MS = 15000;
 const BPM_MIN = 30, BPM_MAX = 300;
-const PROTOCOL_VERSION = 3;          // 2: guías de canción (song / songctl) · 3: configuración musical (config)
+const PROTOCOL_VERSION = 4;          // 2: guías de canción (song / songctl) · 3: configuración musical (config)
+                                     // 4: PFG Player (pset, pstage, pplay, prel) y archivos por partes (blob)
 const MAX_MESSAGE = 512 * 1024;      // una guía de varios instrumentos ocupa decenas de KB
+const BLOB_CHUNK_MAX = 256 * 1024;   // caracteres por parte de un archivo
+const BLOB_MAX_PARTS = 512;          // hasta ~128 MB por archivo
+const ROOM_BLOB_MAX = 96 * 1024 * 1024; // memoria por sala: al pasarse se descartan los más antiguos
+const BLOB_ID = /^[a-f0-9]{16,64}$/;
 // orígenes autorizados para el WebSocket (vacío: cualquiera)
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim().replace(/\/+$/, '')).filter(Boolean);
 
@@ -76,7 +85,9 @@ const server = http.createServer(async (req, res) => {
     } catch (_) { return send(res, 500, 'text/plain', 'Error al generar QR'); }
   }
 
-  const rel = pathname === '/' ? 'index.html' : pathname.slice(1);
+  // PFG Player vive en /player/ con los mismos archivos de la app (una sola base de código)
+  const app = pathname.replace(/^\/player(?=\/|$)/, '') || '/';
+  const rel = app === '/' ? 'index.html' : app.slice(1);
   const file = path.resolve(ROOT, rel);
   if (!file.startsWith(ROOT + path.sep) || PRIVATE_FILES.has(rel) || rel.startsWith('node_modules')) {
     return send(res, 403, 'text/plain', 'Prohibido');
@@ -88,11 +99,11 @@ const server = http.createServer(async (req, res) => {
 // room = { master: ws|null, slaves: Set<ws>, state: último estado del maestro }
 const rooms = new Map();
 const getRoom = id => {
-  if (!rooms.has(id)) rooms.set(id, { master: null, slaves: new Set(), state: null, relay: {} });
+  if (!rooms.has(id)) rooms.set(id, { master: null, slaves: new Set(), state: null, relay: {}, blobs: new Map(), blobBytes: 0, waiting: new Map() });
   return rooms.get(id);
 };
 // mensajes del maestro que se reenvían tal cual a los esclavos: tipo → campo con el contenido
-const RELAY = { config: 'cfg', song: 'song', songctl: 'exits' };
+const RELAY = { config: 'cfg', song: 'song', songctl: 'exits', pset: 'set', pstage: 'stage', pplay: 'play', prel: 'rel' };
 const json = (ws, o) => { if (ws.readyState === 1) ws.send(JSON.stringify(o)); };
 function notifyPeers(room) {
   // maxRtt: peor latencia de los esclavos, para que el maestro calcule cuánto anticipar los cambios
@@ -103,6 +114,38 @@ function notifyPeers(room) {
   if (room.master) json(room.master, msg);
   room.slaves.forEach(s => json(s, msg));
 }
+// ---------- archivos por partes (guías y PDF de PFG Player) ----------
+// blob = { n: partes, parts: [texto], got: recibidas, size: caracteres, at: último uso }
+function sendBlob(ws, id, b) {
+  b.at = Date.now();
+  for (let i = 0; i < b.n; i++) json(ws, { type: 'blob', id, i, n: b.n, data: b.parts[i] });
+}
+function putBlobPart(room, master, m) {
+  const id = String(m.id || ''), n = Number(m.n), i = Number(m.i), data = m.data;
+  if (!BLOB_ID.test(id) || !Number.isInteger(n) || n < 1 || n > BLOB_MAX_PARTS || !Number.isInteger(i) || i < 0 || i >= n
+      || typeof data !== 'string' || data.length > BLOB_CHUNK_MAX) return;
+  let b = room.blobs.get(id);
+  if (b && b.got === b.n) return json(master, { type: 'blobok', id });   // ya estaba completo
+  if (!b || b.n !== n) {
+    if (b) room.blobBytes -= b.size;
+    b = { n, parts: new Array(n), got: 0, size: 0, at: Date.now() };
+    room.blobs.set(id, b);
+  }
+  if (b.parts[i] === undefined) { b.parts[i] = data; b.got++; b.size += data.length; room.blobBytes += data.length; }
+  b.at = Date.now();
+  if (b.got < b.n) return;
+  json(master, { type: 'blobok', id });
+  const waiting = room.waiting.get(id);
+  if (waiting) { waiting.forEach(s => { if (s.readyState === 1) sendBlob(s, id, b); }); room.waiting.delete(id); }
+  // memoria de la sala: se descartan los archivos usados hace más tiempo
+  const sorted = [...room.blobs.entries()].filter(([k]) => k !== id).sort((a, b2) => a[1].at - b2[1].at);
+  while (room.blobBytes > ROOM_BLOB_MAX && sorted.length) {
+    const [k, old] = sorted.shift();
+    room.blobs.delete(k); room.blobBytes -= old.size;
+  }
+}
+const doneBlobs = room => [...room.blobs.entries()].filter(([, b]) => b.got === b.n).map(([k]) => k);
+
 function sanitizeState(m) {
   const bpm = Math.max(BPM_MIN, Math.min(BPM_MAX, Math.round(Number(m.bpm) || 120)));
   if (!m.playing) {
@@ -156,7 +199,7 @@ wss.on('connection', ws => {
         ws.room = String(m.room); ws.role = m.role;
         const slave = m.role === 'slave';
         json(ws, { type: 'welcome', v: PROTOCOL_VERSION, peers: room.slaves.size, hasMaster: !!room.master,
-          state: slave ? room.state : null, relay: slave ? room.relay : null });
+          state: slave ? room.state : null, relay: slave ? room.relay : null, blobs: slave ? undefined : doneBlobs(room) });
         return notifyPeers(room);
       }
 
@@ -171,7 +214,24 @@ wss.on('connection', ws => {
         return;
       }
 
-      default: {         // relevo: config, song, songctl
+      case 'blob': {     // el maestro sube un archivo por partes
+        const room = rooms.get(ws.room);
+        if (!room || room.master !== ws) return;
+        return putBlobPart(room, ws, m);
+      }
+
+      case 'getblob': {  // un esclavo pide un archivo que no tiene en su caché
+        const room = rooms.get(ws.room), id = String(m.id || '');
+        if (!room || !BLOB_ID.test(id)) return;
+        const b = room.blobs.get(id);
+        if (b && b.got === b.n) return sendBlob(ws, id, b);
+        if (!room.waiting.has(id)) room.waiting.set(id, new Set());
+        room.waiting.get(id).add(ws);
+        if (room.master) json(room.master, { type: 'needblob', id });   // p. ej. tras reiniciarse el servidor
+        return;
+      }
+
+      default: {         // relevo: config, song, songctl (GROOVETIME) · pset, pstage, pplay, prel (PFG Player)
         const field = RELAY[m.type];
         const room = rooms.get(ws.room);
         if (!field || !room || room.master !== ws) return;
@@ -193,6 +253,7 @@ wss.on('connection', ws => {
     } else {
       room.slaves.delete(ws);
     }
+    room.waiting.forEach(set => set.delete(ws));
     if (!room.master && room.slaves.size === 0) rooms.delete(ws.room);
     else notifyPeers(room);
   });
@@ -207,7 +268,7 @@ setInterval(() => {
 }, HEARTBEAT_MS);
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`GROOVETIME · servidor de sincronización en el puerto ${PORT}`);
+  console.log(`GROOVETIME / PFG Player · servidor de sincronización (v${PROTOCOL_VERSION}) en el puerto ${PORT}`);
   console.log(`  este equipo:  http://localhost:${PORT}`);
   lanIPs().forEach(ip => console.log(`  otros equipos: http://${ip}:${PORT}`));
 });
