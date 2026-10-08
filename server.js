@@ -13,6 +13,8 @@
      salida de secciones OPEN (prel) por el mismo relevo. Las guías (y los PDF) viajan como
      archivos por partes (blob): el maestro los sube una vez por sala, el servidor los guarda en
      memoria mientras la sala exista y cada esclavo pide sólo los que no tiene en su caché.
+   - Versión 5: cada esclavo puede contarle al maestro qué es (pdev): pantalla de video y/o equipo
+     de audio (con los temas cuyas secuencias tiene). El maestro sabe así qué equipos hay en la sala.
    Uso local:  npm install  →  npm start   (o PORT=9000 node server.js)
    En la nube: ALLOWED_ORIGINS=https://tu-app.github.io limita qué sitios pueden conectarse.
    ===================================================================== */
@@ -28,8 +30,9 @@ const PORT = Number(process.env.PORT) || 8080;
 const ROOT = __dirname;
 const HEARTBEAT_MS = 15000;
 const BPM_MIN = 30, BPM_MAX = 300;
-const PROTOCOL_VERSION = 4;          // 2: guías de canción (song / songctl) · 3: configuración musical (config)
+const PROTOCOL_VERSION = 5;          // 2: guías de canción (song / songctl) · 3: configuración musical (config)
                                      // 4: PFG Player (pset, pstage, pplay, prel) y archivos por partes (blob)
+                                     // 5: equipos de la sala (pdev: pantalla de video, equipo de audio)
 const MAX_MESSAGE = 512 * 1024;      // una guía de varios instrumentos ocupa decenas de KB
 const BLOB_CHUNK_MAX = 256 * 1024;   // caracteres por parte de un archivo
 const BLOB_MAX_PARTS = 512;          // hasta ~128 MB por archivo
@@ -164,8 +167,16 @@ const wss = new WebSocketServer({
   server, path: '/sync', maxPayload: MAX_MESSAGE, perMessageDeflate: false,
   verifyClient: ({ origin }) => !ALLOWED_ORIGINS.length || ALLOWED_ORIGINS.includes(origin)
 });
+// lo que un esclavo cuenta de sí mismo (sólo lo que el maestro necesita saber)
+function sanitizeDev(d) {
+  if (!d || typeof d !== 'object') return null;
+  const ids = v => Array.isArray(v) ? v.filter(x => typeof x === 'string' && x.length <= 64).slice(0, 500) : [];
+  // audio: temas cuya secuencia toca · sounds: temas cuyos sonidos por sección toca
+  return { name: String(d.name || '').slice(0, 40), screen: !!d.screen, sound: !!d.sound, audio: ids(d.audio), sounds: ids(d.sounds) };
+}
+let nextId = 1;
 wss.on('connection', ws => {
-  ws.alive = true;
+  ws.alive = true; ws.id = nextId++;
   ws.on('pong', () => { ws.alive = true; });
 
   ws.on('message', raw => {
@@ -200,7 +211,17 @@ wss.on('connection', ws => {
         const slave = m.role === 'slave';
         json(ws, { type: 'welcome', v: PROTOCOL_VERSION, peers: room.slaves.size, hasMaster: !!room.master,
           state: slave ? room.state : null, relay: slave ? room.relay : null, blobs: slave ? undefined : doneBlobs(room) });
+        // el maestro (nuevo o reconectado) recibe lo que ya contaron los esclavos
+        if (!slave) room.slaves.forEach(s => { if (s.dev) json(ws, { type: 'pdev', id: s.id, dev: s.dev }); });
         return notifyPeers(room);
+      }
+
+      case 'pdev': {     // un esclavo cuenta qué es (pantalla, audio): sólo lo recibe el maestro
+        const room = rooms.get(ws.room);
+        if (!room || ws.role !== 'slave') return;
+        ws.dev = sanitizeDev(m.dev);
+        if (room.master) json(room.master, { type: 'pdev', id: ws.id, dev: ws.dev });
+        return;
       }
 
       case 'state': {
@@ -252,6 +273,7 @@ wss.on('connection', ws => {
       room.slaves.forEach(s => json(s, { type: 'masterGone' }));
     } else {
       room.slaves.delete(ws);
+      if (ws.dev && room.master) json(room.master, { type: 'pdev', id: ws.id, dev: null });
     }
     room.waiting.forEach(set => set.delete(ws));
     if (!room.master && room.slaves.size === 0) rooms.delete(ws.room);
