@@ -13,8 +13,8 @@
      salida de secciones OPEN (prel) por el mismo relevo. Las guías (y los PDF) viajan como
      archivos por partes (blob): el maestro los sube una vez por sala, el servidor los guarda en
      memoria mientras la sala exista y cada esclavo pide sólo los que no tiene en su caché.
-   - Versión 5: cada esclavo puede contarle al maestro qué es (pdev): pantalla de video, equipo
-     de audio (con los temas cuyas secuencias y sonidos tiene) y/o el que manda el MIDI del show. El maestro sabe así qué equipos hay en la sala.
+   - Versión 5: cada esclavo puede contarle al maestro qué es (pdev): pantalla de video y/o equipo
+     de audio (con los temas cuyas secuencias tiene). El maestro sabe así qué equipos hay en la sala.
    - Versión 6 (Stick Master): cada app puede tener su propio espacio de salas (hello.app), así un
      código de GROOVETIME y uno de Stick Master nunca se cruzan. Relevo smcfg (configuración de la
      clase) y marcador en vivo (score): cada alumno envía su precisión y racha, sólo al maestro.
@@ -179,7 +179,7 @@ function sanitizeDev(d) {
   if (!d || typeof d !== 'object') return null;
   const ids = v => Array.isArray(v) ? v.filter(x => typeof x === 'string' && x.length <= 64).slice(0, 500) : [];
   // audio: temas cuya secuencia toca · sounds: temas cuyos sonidos por sección toca
-  return { name: String(d.name || '').slice(0, 40), screen: !!d.screen, sound: !!d.sound, midi: !!d.midi, audio: ids(d.audio), sounds: ids(d.sounds) };
+  return { name: String(d.name || '').slice(0, 40), screen: !!d.screen, sound: !!d.sound, audio: ids(d.audio), sounds: ids(d.sounds) };
 }
 // marcador de Stick Master: lo que un alumno cuenta de su práctica (sólo lo recibe el maestro)
 function sanitizeScore(d) {
@@ -189,7 +189,7 @@ function sanitizeScore(d) {
     n: String(d.n || '').slice(0, 24), m: ['book', 'free', 'capture'].includes(d.m) ? d.m : 'book', run: !!d.run,
     p: int(d.p ?? -1, -1, 100), st: int(d.st, 0, 1e6), b: int(d.b, 0, 1e6), h: int(d.h, 0, 1e7),
     ok: int(d.ok, 0, 1e7), er: int(d.er, 0, 1e7), off: int(d.off, -1000, 1000),
-    t: String(d.t || '').slice(0, 12), s: d.s === 'mic' ? 'mic' : 'touch'
+    t: String(d.t || '').slice(0, 12), s: ['mic', 'midi'].includes(d.s) ? d.s : 'touch'
   };
 }
 // Stick Master en vivo: resultado de una nota o golpe del alumno que el maestro está mirando
