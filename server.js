@@ -1,6 +1,6 @@
 'use strict';
 /* =====================================================================
-   GROOVETIME, PFG Player y Stick Master · servidor de sincronización maestro/esclavo (red local o nube)
+   GROOVETIME y PFG Player · servidor de sincronización maestro/esclavo (red local o nube)
    - Sirve la app (index.html, manifest, iconos, sw.js) si los archivos están junto a él.
    - /sync ...... WebSocket: salas de 4 dígitos con un maestro y N esclavos.
    - /info ...... IPs locales y puerto (para armar la URL del QR en la red local).
@@ -13,13 +13,8 @@
      salida de secciones OPEN (prel) por el mismo relevo. Las guías (y los PDF) viajan como
      archivos por partes (blob): el maestro los sube una vez por sala, el servidor los guarda en
      memoria mientras la sala exista y cada esclavo pide sólo los que no tiene en su caché.
-   - Versión 5: cada esclavo puede contarle al maestro qué es (pdev): pantalla de video y/o equipo
-     de audio (con los temas cuyas secuencias tiene). El maestro sabe así qué equipos hay en la sala.
-   - Versión 6 (Stick Master): cada app puede tener su propio espacio de salas (hello.app), así un
-     código de GROOVETIME y uno de Stick Master nunca se cruzan. Relevo smcfg (configuración de la
-     clase) y marcador en vivo (score): cada alumno envía su precisión y racha, sólo al maestro.
-   - Versión 7 (Stick Master): el maestro puede mirar a un alumno (smwatch); mientras lo mira, ese
-     alumno le envía el resultado de cada nota (smlive) y el maestro dibuja su pantalla en vivo.
+   - Versión 5: cada esclavo puede contarle al maestro qué es (pdev): pantalla de video, equipo
+     de audio (con los temas cuyas secuencias y sonidos tiene) y/o el que manda el MIDI del show. El maestro sabe así qué equipos hay en la sala.
    Uso local:  npm install  →  npm start   (o PORT=9000 node server.js)
    En la nube: ALLOWED_ORIGINS=https://tu-app.github.io limita qué sitios pueden conectarse.
    ===================================================================== */
@@ -35,11 +30,9 @@ const PORT = Number(process.env.PORT) || 8080;
 const ROOT = __dirname;
 const HEARTBEAT_MS = 15000;
 const BPM_MIN = 30, BPM_MAX = 300;
-const PROTOCOL_VERSION = 7;          // 2: guías de canción (song / songctl) · 3: configuración musical (config)
+const PROTOCOL_VERSION = 5;          // 2: guías de canción (song / songctl) · 3: configuración musical (config)
                                      // 4: PFG Player (pset, pstage, pplay, prel) y archivos por partes (blob)
                                      // 5: equipos de la sala (pdev: pantalla de video, equipo de audio)
-                                     // 6: salas por app (hello.app), Stick Master (smcfg) y marcador (score)
-                                     // 7: ver a un alumno en vivo (smwatch maestro→alumno, smlive alumno→maestro)
 const MAX_MESSAGE = 512 * 1024;      // una guía de varios instrumentos ocupa decenas de KB
 const BLOB_CHUNK_MAX = 256 * 1024;   // caracteres por parte de un archivo
 const BLOB_MAX_PARTS = 512;          // hasta ~128 MB por archivo
@@ -113,7 +106,7 @@ const getRoom = id => {
   return rooms.get(id);
 };
 // mensajes del maestro que se reenvían tal cual a los esclavos: tipo → campo con el contenido
-const RELAY = { config: 'cfg', song: 'song', songctl: 'exits', pset: 'set', pstage: 'stage', pplay: 'play', prel: 'rel', smcfg: 'cfg' };
+const RELAY = { config: 'cfg', song: 'song', songctl: 'exits', pset: 'set', pstage: 'stage', pplay: 'play', prel: 'rel' };
 const json = (ws, o) => { if (ws.readyState === 1) ws.send(JSON.stringify(o)); };
 function notifyPeers(room) {
   // maxRtt: peor latencia de los esclavos, para que el maestro calcule cuánto anticipar los cambios
@@ -179,29 +172,8 @@ function sanitizeDev(d) {
   if (!d || typeof d !== 'object') return null;
   const ids = v => Array.isArray(v) ? v.filter(x => typeof x === 'string' && x.length <= 64).slice(0, 500) : [];
   // audio: temas cuya secuencia toca · sounds: temas cuyos sonidos por sección toca
-  return { name: String(d.name || '').slice(0, 40), screen: !!d.screen, sound: !!d.sound, audio: ids(d.audio), sounds: ids(d.sounds) };
+  return { name: String(d.name || '').slice(0, 40), screen: !!d.screen, sound: !!d.sound, midi: !!d.midi, audio: ids(d.audio), sounds: ids(d.sounds) };
 }
-// marcador de Stick Master: lo que un alumno cuenta de su práctica (sólo lo recibe el maestro)
-function sanitizeScore(d) {
-  if (!d || typeof d !== 'object') return null;
-  const int = (v, a, b) => Math.max(a, Math.min(b, Math.round(Number(v) || 0)));
-  return {
-    n: String(d.n || '').slice(0, 24), m: ['book', 'free', 'capture'].includes(d.m) ? d.m : 'book', run: !!d.run,
-    p: int(d.p ?? -1, -1, 100), st: int(d.st, 0, 1e6), b: int(d.b, 0, 1e6), h: int(d.h, 0, 1e7),
-    ok: int(d.ok, 0, 1e7), er: int(d.er, 0, 1e7), off: int(d.off, -1000, 1000),
-    t: String(d.t || '').slice(0, 12), s: d.s === 'mic' ? 'mic' : 'touch'
-  };
-}
-// Stick Master en vivo: resultado de una nota o golpe del alumno que el maestro está mirando
-const LIVE_NUM = ['r', 'i', 'ok', 'o', 't', 'a', 'st', 'b', 'okc', 'er', 'p'];
-function sanitizeLive(e) {
-  if (!e || typeof e !== 'object' || !['n', 'm', 'x', 'h'].includes(e.k)) return null;
-  const out = { k: e.k, hd: e.hd === 'L' || e.hd === 'R' ? e.hd : null };
-  for (const k of LIVE_NUM) { const v = Number(e[k]); if (Number.isFinite(v)) out[k] = v; }
-  return out;
-}
-// espacio de salas por app: sin app (GROOVETIME, PFG Player) la clave es el código tal cual
-const roomKey = (room, app) => /^[a-z]{2,8}$/.test(String(app || '')) ? `${app}:${room}` : String(room);
 let nextId = 1;
 wss.on('connection', ws => {
   ws.alive = true; ws.id = nextId++;
@@ -228,23 +200,19 @@ wss.on('connection', ws => {
 
       case 'hello': {
         if (ws.room || !/^\d{4}$/.test(String(m.room)) || !['master', 'slave'].includes(m.role)) return;
-        const key = roomKey(m.room, m.app);
-        const room = getRoom(key);
+        const room = getRoom(String(m.room));
         if (m.role === 'master') {
           if (room.master) return json(ws, { type: 'error', msg: 'La sala ya tiene maestro' });
           room.master = ws; room.state = null;
         } else {
           room.slaves.add(ws);
         }
-        ws.room = key; ws.role = m.role;
+        ws.room = String(m.room); ws.role = m.role;
         const slave = m.role === 'slave';
         json(ws, { type: 'welcome', v: PROTOCOL_VERSION, peers: room.slaves.size, hasMaster: !!room.master,
           state: slave ? room.state : null, relay: slave ? room.relay : null, blobs: slave ? undefined : doneBlobs(room) });
         // el maestro (nuevo o reconectado) recibe lo que ya contaron los esclavos
-        if (!slave) room.slaves.forEach(s => {
-          if (s.dev) json(ws, { type: 'pdev', id: s.id, dev: s.dev });
-          if (s.score) json(ws, { type: 'score', id: s.id, s: s.score });
-        });
+        if (!slave) room.slaves.forEach(s => { if (s.dev) json(ws, { type: 'pdev', id: s.id, dev: s.dev }); });
         return notifyPeers(room);
       }
 
@@ -253,29 +221,6 @@ wss.on('connection', ws => {
         if (!room || ws.role !== 'slave') return;
         ws.dev = sanitizeDev(m.dev);
         if (room.master) json(room.master, { type: 'pdev', id: ws.id, dev: ws.dev });
-        return;
-      }
-
-      case 'score': {    // Stick Master: un alumno informa su precisión y racha; sólo lo recibe el maestro
-        const room = rooms.get(ws.room);
-        if (!room || ws.role !== 'slave') return;
-        ws.score = sanitizeScore(m.s);
-        if (room.master) json(room.master, { type: 'score', id: ws.id, s: ws.score });
-        return;
-      }
-
-      case 'smwatch': {  // Stick Master: el maestro empieza o deja de mirar a un alumno
-        const room = rooms.get(ws.room);
-        if (!room || room.master !== ws) return;
-        room.slaves.forEach(s => { if (s.id === Number(m.id)) json(s, { type: 'smwatch', on: !!m.on }); });
-        return;
-      }
-
-      case 'smlive': {   // Stick Master: resultado en vivo del alumno mirado (sólo al maestro)
-        const room = rooms.get(ws.room);
-        const e = sanitizeLive(m.e);
-        if (!room || ws.role !== 'slave' || !room.master || !e) return;
-        json(room.master, { type: 'smlive', id: ws.id, e });
         return;
       }
 
@@ -307,7 +252,7 @@ wss.on('connection', ws => {
         return;
       }
 
-      default: {         // relevo: config, song, songctl (GROOVETIME) · pset, pstage, pplay, prel (PFG Player) · smcfg (Stick Master)
+      default: {         // relevo: config, song, songctl (GROOVETIME) · pset, pstage, pplay, prel (PFG Player)
         const field = RELAY[m.type];
         const room = rooms.get(ws.room);
         if (!field || !room || room.master !== ws) return;
@@ -329,7 +274,6 @@ wss.on('connection', ws => {
     } else {
       room.slaves.delete(ws);
       if (ws.dev && room.master) json(room.master, { type: 'pdev', id: ws.id, dev: null });
-      if (ws.score && room.master) json(room.master, { type: 'score', id: ws.id, s: null });
     }
     room.waiting.forEach(set => set.delete(ws));
     if (!room.master && room.slaves.size === 0) rooms.delete(ws.room);
@@ -346,7 +290,7 @@ setInterval(() => {
 }, HEARTBEAT_MS);
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`GROOVETIME / PFG Player / Stick Master · servidor de sincronización (v${PROTOCOL_VERSION}) en el puerto ${PORT}`);
+  console.log(`GROOVETIME / PFG Player · servidor de sincronización (v${PROTOCOL_VERSION}) en el puerto ${PORT}`);
   console.log(`  este equipo:  http://localhost:${PORT}`);
   lanIPs().forEach(ip => console.log(`  otros equipos: http://${ip}:${PORT}`));
 });
