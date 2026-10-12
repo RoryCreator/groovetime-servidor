@@ -58,7 +58,7 @@ const MIME = {
   '.css': 'text/css; charset=utf-8', '.png': 'image/png', '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon', '.jpg': 'image/jpeg', '.webp': 'image/webp'
 };
-const PRIVATE_FILES = new Set(['server.js', 'package.json', 'package-lock.json', 'render.yaml', 'rdrum-trials.cjs', '.env', '.env.example']);
+const PRIVATE_FILES = new Set(['server.js', 'package.json', 'package-lock.json', 'render.yaml', 'rdrum-trials.cjs', 'rdrum-admin.cjs', 'rdrum-admin.html', 'rdrum-admin.js', '.env', '.env.example']);
 
 function lanIPs() {
   const out = [];
