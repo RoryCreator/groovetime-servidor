@@ -31,6 +31,10 @@ const { performance } = require('perf_hooks');
 const { WebSocketServer } = require('ws');
 const QRCode = require('qrcode');
 
+let rdrumTrials;
+try { rdrumTrials=require('./rdrum-trials.cjs').fromEnvironment(); }
+catch { console.error('R-DRUM trial: configuración no válida; sincronización musical sigue disponible.'); rdrumTrials=async(req,res)=>{if(new URL(req.url,'http://localhost').pathname!=='/api/rdrum/trial')return false;res.writeHead(503,{'Content-Type':'application/json'});res.end(JSON.stringify({error:'Prueba no configurada.'}));return true;}; }
+
 const PORT = Number(process.env.PORT) || 8080;
 const ROOT = __dirname;
 const HEARTBEAT_MS = 15000;
@@ -54,7 +58,7 @@ const MIME = {
   '.css': 'text/css; charset=utf-8', '.png': 'image/png', '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon', '.jpg': 'image/jpeg', '.webp': 'image/webp'
 };
-const PRIVATE_FILES = new Set(['server.js', 'package.json', 'package-lock.json', 'render.yaml']);
+const PRIVATE_FILES = new Set(['server.js', 'package.json', 'package-lock.json', 'render.yaml', 'rdrum-trials.cjs', '.env', '.env.example']);
 
 function lanIPs() {
   const out = [];
@@ -78,6 +82,7 @@ function serveFile(res, file) {
   });
 }
 const server = http.createServer(async (req, res) => {
+  if(await rdrumTrials(req,res))return;
   const url = new URL(req.url, 'http://localhost');
   const pathname = decodeURIComponent(url.pathname);
 
